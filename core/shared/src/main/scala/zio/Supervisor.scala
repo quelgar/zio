@@ -50,6 +50,9 @@ abstract class Supervisor[+A] { self =>
   final def ++[B](that: Supervisor[B]): Supervisor[(A, B)] =
     Supervisor.Zip(self, that)
 
+  final private[zio] def addToSet(that: Supervisor[_]): Supervisor[Any] =
+    Supervisor.SupervisorSet(Supervisor.toSet(self) ++ Supervisor.toSet(that))
+
   def onStart[R, E, A](
     environment: ZEnvironment[R],
     effect: ZIO[R, E, A],
@@ -197,7 +200,7 @@ object Supervisor {
 
       def loop(supervisor: Supervisor[Any], patches: List[Patch]): Supervisor[Any] =
         patches match {
-          case AddSupervisor(added) :: patches      => loop(supervisor ++ added, patches)
+          case AddSupervisor(added) :: patches      => loop(supervisor.addToSet(added), patches)
           case AndThen(first, second) :: patches    => loop(supervisor, first :: second :: patches)
           case Empty :: patches                     => loop(supervisor, patches)
           case RemoveSupervisor(removed) :: patches => loop(removeSupervisor(supervisor, removed), patches)
@@ -280,19 +283,58 @@ object Supervisor {
     }
   }
 
+  private final case class SupervisorSet(set: Set[Supervisor[Any]]) extends Supervisor[Unit] {
+
+    override def value(implicit trace: Trace): UIO[Unit] = ZIO.unit
+
+    override def onStart[R, E, A](
+      environment: ZEnvironment[R],
+      effect: ZIO[R, E, A],
+      parent: Option[Fiber.Runtime[Any, Any]],
+      fiber: Fiber.Runtime[E, A]
+    )(implicit unsafe: Unsafe): Unit =
+      set.foreach(_.onStart(environment, effect, parent, fiber))
+
+    override def onEnd[R, E, A](value: Exit[E, A], fiber: Fiber.Runtime[E, A])(implicit unsafe: Unsafe): Unit =
+      set.foreach(_.onEnd(value, fiber))
+
+    override def onEffect[E, A](fiber: Fiber.Runtime[E, A], effect: ZIO[_, _, _])(implicit
+      unsafe: Unsafe
+    ): Unit =
+      set.foreach(_.onEffect(fiber, effect))
+
+    override def onSuspend[E, A](fiber: Fiber.Runtime[E, A])(implicit unsafe: Unsafe): Unit =
+      set.foreach(_.onSuspend(fiber))
+
+    override def onResume[E, A](fiber: Fiber.Runtime[E, A])(implicit unsafe: Unsafe): Unit =
+      set.foreach(_.onResume(fiber))
+
+  }
+
   private def removeSupervisor(self: Supervisor[Any], that: Supervisor[Any]): Supervisor[Any] =
     if (self eq that) Supervisor.none
     else
       self match {
-        case Zip(left, right) => removeSupervisor(left, that) ++ removeSupervisor(right, that)
-        case supervisor       => supervisor
+        case Zip(left, right)   => removeSupervisor(left, that) ++ removeSupervisor(right, that)
+        case SupervisorSet(set) => SupervisorSet(set - that)
+        case supervisor         => supervisor
       }
 
   private[zio] def toSet(supervisor: Supervisor[Any]): Set[Supervisor[Any]] =
     if (supervisor eq Supervisor.none) Set.empty
     else
       supervisor match {
-        case Zip(left, right) => toSet(left) ++ toSet(right)
-        case supervisor       => Set(supervisor)
+        case Zip(left, right)   => toSet(left) ++ toSet(right)
+        case SupervisorSet(set) => set
+        case supervisor         => Set(supervisor)
       }
+
+  // for tests
+  private[zio] def allSupervisors(supervisor: Supervisor[Any]): Chunk[Supervisor[Any]] =
+    supervisor match {
+      case Zip(left, right)   => allSupervisors(left) ++ allSupervisors(right)
+      case SupervisorSet(set) => Chunk.fromIterable(set)
+      case supervisor         => Chunk.single(supervisor)
+    }
+
 }
